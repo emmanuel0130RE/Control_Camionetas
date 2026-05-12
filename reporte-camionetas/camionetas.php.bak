@@ -1,0 +1,179 @@
+<?php
+declare(strict_types=1);
+require_once __DIR__ . '/config.php';
+
+function h($v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+function money($n): string { return number_format((float)$n, 0); }
+function post($k, $d='') { return trim((string)($_POST[$k] ?? $d)); }
+function redirect_self(): void { header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?')); exit; }
+function camioneta_model_year(string $modelo): int {
+    if (preg_match('/(19|20)\d{2}/', $modelo, $m)) return (int)$m[0];
+    return 0;
+}
+function mantenimiento_intervalo_km(string $modelo): int {
+    $year = camioneta_model_year($modelo);
+    return in_array($year, [2014, 2015], true) ? 10000 : 5000;
+}
+function proximo_mantenimiento_km(array $t): int {
+    $intervalo = mantenimiento_intervalo_km((string)($t['modelo'] ?? ''));
+    $actual = (int)($t['kilometraje_actual'] ?? 0);
+    return ((int)floor($actual / $intervalo) + 1) * $intervalo;
+}
+
+$errors = [];
+$ok = '';
+
+function ensure_camioneta_tables(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `camionetas` (
+      `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+      `eco` VARCHAR(30) NOT NULL,
+      `modelo` VARCHAR(120) NOT NULL,
+      `no_serie` VARCHAR(120) NOT NULL,
+      `matricula` VARCHAR(50) NOT NULL,
+      `actividad` ENUM('en ruta','sin uso','mantenimiento') NOT NULL DEFAULT 'sin uso',
+      `fecha_ultimo_mantenimiento` DATE NULL,
+      `kilometraje_actual` INT UNSIGNED NOT NULL DEFAULT 0,
+      `tanque_gasolina` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+      `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (`id`),
+      UNIQUE KEY `uniq_camionetas_eco` (`eco`),
+      UNIQUE KEY `uniq_camionetas_serie` (`no_serie`),
+      UNIQUE KEY `uniq_camionetas_matricula` (`matricula`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `camioneta_conductores` (
+      `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+      `camioneta_id` INT UNSIGNED NOT NULL,
+      `empleado_id` INT UNSIGNED NULL,
+      `nombre` VARCHAR(160) NOT NULL,
+      `telefono` VARCHAR(40) NULL,
+      `correo` VARCHAR(160) NULL,
+      `fecha_inicio` DATE NOT NULL,
+      `fecha_fin` DATE NULL,
+      `activo` TINYINT(1) NOT NULL DEFAULT 1,
+      `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (`id`),
+      KEY `idx_camioneta_conductores_camioneta` (`camioneta_id`),
+      CONSTRAINT `fk_camioneta_conductores_camioneta` FOREIGN KEY (`camioneta_id`) REFERENCES `camionetas`(`id`) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `camioneta_indicadores_diarios` (
+      `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+      `camioneta_id` INT UNSIGNED NOT NULL,
+      `fecha` DATE NOT NULL,
+      `kilometraje` INT UNSIGNED NOT NULL,
+      `tanque_gasolina` TINYINT UNSIGNED NOT NULL,
+      `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (`id`),
+      UNIQUE KEY `uniq_camioneta_fecha` (`camioneta_id`,`fecha`),
+      CONSTRAINT `fk_indicadores_camioneta` FOREIGN KEY (`camioneta_id`) REFERENCES `camionetas`(`id`) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS `camioneta_mantenimientos` (
+      `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+      `camioneta_id` INT UNSIGNED NOT NULL,
+      `fecha_mantenimiento` DATE NOT NULL,
+      `kilometraje` INT UNSIGNED NULL,
+      `notas` TEXT NULL,
+      `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (`id`),
+      KEY `idx_mant_camioneta` (`camioneta_id`),
+      CONSTRAINT `fk_mant_camioneta` FOREIGN KEY (`camioneta_id`) REFERENCES `camionetas`(`id`) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+ensure_camioneta_tables($pdo);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = post('action');
+    try {
+        if ($action === 'add_truck') {
+            $eco = post('eco'); $modelo = post('modelo'); $serie = post('no_serie'); $matricula = post('matricula');
+            $actividad = post('actividad', 'sin uso');
+            $mant = post('fecha_ultimo_mantenimiento') ?: null;
+            $km = max(0, (int)post('kilometraje_actual', '0'));
+            $tanque = min(100, max(0, (int)post('tanque_gasolina', '0')));
+            $nombre = post('nombre_conductor'); $tel = post('telefono_conductor'); $correo = post('correo_conductor'); $fechaUso = post('fecha_uso');
+            if ($eco==='' || $modelo==='' || $serie==='' || $matricula==='') throw new RuntimeException('Llena Eco, modelo, número de serie y matrícula.');
+            if (!in_array($actividad, ['en ruta','sin uso','mantenimiento'], true)) throw new RuntimeException('Actividad inválida.');
+            if ($actividad === 'en ruta' && ($nombre==='' || $tel==='' || $correo==='' || $fechaUso==='')) throw new RuntimeException('Si la camioneta está en ruta, el conductor, teléfono, correo y fecha de uso son obligatorios.');
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare("INSERT INTO camionetas (eco,modelo,no_serie,matricula,actividad,fecha_ultimo_mantenimiento,kilometraje_actual,tanque_gasolina) VALUES (?,?,?,?,?,?,?,?)");
+            $stmt->execute([$eco,$modelo,$serie,$matricula,$actividad,$mant,$km,$tanque]);
+            $truckId = (int)$pdo->lastInsertId();
+            $stmt = $pdo->prepare("INSERT INTO camioneta_indicadores_diarios (camioneta_id,fecha,kilometraje,tanque_gasolina) VALUES (?,CURDATE(),?,?) ON DUPLICATE KEY UPDATE kilometraje=VALUES(kilometraje), tanque_gasolina=VALUES(tanque_gasolina)");
+            $stmt->execute([$truckId,$km,$tanque]);
+            if ($nombre !== '') {
+                $stmt = $pdo->prepare("INSERT INTO camioneta_conductores (camioneta_id,nombre,telefono,correo,fecha_inicio,activo) VALUES (?,?,?,?,?,1)");
+                $stmt->execute([$truckId,$nombre,$tel ?: null,$correo ?: null,$fechaUso ?: date('Y-m-d')]);
+            }
+            $pdo->commit();
+            redirect_self();
+        }
+        if ($action === 'update_plates') {
+            $id=(int)post('id'); $mat=post('matricula'); if ($mat==='') throw new RuntimeException('La matrícula no puede ir vacía.');
+            $pdo->prepare("UPDATE camionetas SET matricula=? WHERE id=?")->execute([$mat,$id]); redirect_self();
+        }
+        if ($action === 'update_indicators') {
+            $id=(int)post('id'); $km=max(0,(int)post('kilometraje_actual','0')); $tanque=min(100,max(0,(int)post('tanque_gasolina','0')));
+            $pdo->prepare("UPDATE camionetas SET kilometraje_actual=?, tanque_gasolina=? WHERE id=?")->execute([$km,$tanque,$id]);
+            $pdo->prepare("INSERT INTO camioneta_indicadores_diarios (camioneta_id,fecha,kilometraje,tanque_gasolina) VALUES (?,CURDATE(),?,?) ON DUPLICATE KEY UPDATE kilometraje=VALUES(kilometraje), tanque_gasolina=VALUES(tanque_gasolina)")->execute([$id,$km,$tanque]);
+            redirect_self();
+        }
+        if ($action === 'update_driver') {
+            $id=(int)post('id'); $act=post('actividad','en ruta'); $nombre=post('nombre_conductor'); $tel=post('telefono_conductor'); $correo=post('correo_conductor'); $fecha=post('fecha_uso') ?: date('Y-m-d');
+            if ($act === 'en ruta' && ($nombre==='' || $tel==='' || $correo==='')) throw new RuntimeException('Para ponerla en ruta, conductor, teléfono y correo son obligatorios.');
+            $pdo->beginTransaction();
+            $pdo->prepare("UPDATE camioneta_conductores SET activo=0, fecha_fin=DATE_SUB(?, INTERVAL 1 DAY) WHERE camioneta_id=? AND activo=1")->execute([$fecha,$id]);
+            if ($nombre !== '') $pdo->prepare("INSERT INTO camioneta_conductores (camioneta_id,nombre,telefono,correo,fecha_inicio,activo) VALUES (?,?,?,?,?,1)")->execute([$id,$nombre,$tel ?: null,$correo ?: null,$fecha,1]);
+            $pdo->prepare("UPDATE camionetas SET actividad=? WHERE id=?")->execute([$act,$id]);
+            $pdo->commit(); redirect_self();
+        }
+        if ($action === 'update_maintenance') {
+            $id=(int)post('id'); $fecha=post('fecha_mantenimiento') ?: date('Y-m-d'); $km=post('kilometraje') !== '' ? (int)post('kilometraje') : null; $notas=post('notas');
+            $pdo->prepare("INSERT INTO camioneta_mantenimientos (camioneta_id,fecha_mantenimiento,kilometraje,notas) VALUES (?,?,?,?)")->execute([$id,$fecha,$km,$notas ?: null]);
+            $pdo->prepare("UPDATE camionetas SET fecha_ultimo_mantenimiento=?, actividad='mantenimiento' WHERE id=?")->execute([$fecha,$id]);
+            redirect_self();
+        }
+    } catch (PDOException $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        $errors[] = str_contains($e->getMessage(), 'Duplicate') ? 'No se puede repetir Eco, matrícula o número de serie.' : $e->getMessage();
+    } catch (Throwable $e) {
+        if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+        $errors[] = $e->getMessage();
+    }
+}
+
+$vendors = [];
+try {
+    $vendors = $pdo->query("SELECT DISTINCT Vendedor FROM TClientesA WHERE Vendedor IS NOT NULL AND Vendedor<>'' ORDER BY Vendedor LIMIT 300")->fetchAll(PDO::FETCH_COLUMN);
+} catch(Throwable $e) {}
+$quitarVendedores = ['Cesar','Daniel','David','Gamaniel','Gerardo','Gerardo R11 Martes','Jacinto Guadalupe','Jonathan Arthuro','Jose Gilberto','Lorenzo','LUIS ANTONIO','Marco Antonio'];
+$vendors = array_values(array_filter($vendors, fn($v) => !in_array(trim((string)$v), $quitarVendedores, true)));
+if (!in_array('Jose Armando', $vendors, true)) $vendors[] = 'Jose Armando';
+sort($vendors, SORT_NATURAL | SORT_FLAG_CASE);
+$trucks = $pdo->query("SELECT c.*, cc.nombre conductor, cc.telefono, cc.correo, cc.fecha_inicio FROM camionetas c LEFT JOIN camioneta_conductores cc ON cc.camioneta_id=c.id AND cc.activo=1 ORDER BY FIELD(c.actividad,'en ruta','sin uso','mantenimiento'), c.eco")->fetchAll();
+$active = array_values(array_filter($trucks, fn($t)=>$t['actividad']==='en ruta'));
+$inactive = array_values(array_filter($trucks, fn($t)=>$t['actividad']!=='en ruta'));
+$stats = ['total'=>count($trucks),'activas'=>count($active),'mantenimiento'=>count(array_filter($trucks, fn($t)=>$t['actividad']==='mantenimiento')),'inactivas'=>count(array_filter($trucks, fn($t)=>$t['actividad']==='sin uso'))];
+?>
+<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Control de Unidades</title>
+<style>
+:root{--bg:#dfe8f4;--panel:#eef3fa;--card:#f7faff;--ink:#0b162e;--muted:#65738a;--nav:#061737;--blue:#2f64b5;--orange:#ff9a3d;--line:rgba(11,22,46,.12);--green:#22a363;--red:#e53e3e}*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial,sans-serif;background:linear-gradient(135deg,#eef3fa,#cfdbea);color:var(--ink)}.wrap{max-width:1780px;margin:0 auto;padding:26px 42px 60px}.nav{display:flex;align-items:center;gap:34px;background:var(--nav);border-radius:24px;padding:14px 28px;color:white;box-shadow:0 18px 40px rgba(2,10,30,.22);position:sticky;top:10px;z-index:5}.logo{height:48px}.nav a{color:white;text-decoration:none;font-weight:800;padding:12px 18px;border-radius:12px}.nav a.active{background:rgba(255,255,255,.14)}.hello{margin-left:auto;font-weight:800;font-size:18px}.hero{display:flex;justify-content:space-between;align-items:end;margin:115px 10px 28px}.hero h1{font-size:46px;margin:0;font-weight:950}.date{text-align:right;font-weight:900;color:var(--muted);font-size:20px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:36px}.stat,.truck,.box,.modal-card{background:rgba(247,250,255,.7);border:1px solid rgba(255,255,255,.9);border-radius:18px;box-shadow:inset 0 1px rgba(255,255,255,.85),0 14px 38px rgba(20,40,80,.08)}.stat{padding:18px}.stat h3{margin:0 0 16px;font-size:20px}.stat-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.pillbox{background:rgba(255,255,255,.64);border-radius:12px;padding:14px;font-weight:900}.pillbox span{display:block;color:var(--muted);font-size:14px}.chart{height:90px;display:flex;gap:26px;align-items:end;padding:10px 20px}.bar{width:70px;background:#0d2555;border-radius:6px 6px 0 0}.bar.o{background:#ff9a3d}.section-head{display:flex;align-items:center;justify-content:space-between;margin:26px 4px 18px}.section-head h2{font-size:30px;margin:0}.btn{border:0;border-radius:10px;background:var(--nav);color:white;padding:12px 22px;font-weight:900;cursor:pointer}.btn.blue{background:var(--blue)}.btn.light{background:#fff;color:var(--nav);border:1px solid var(--line)}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}.truck{display:grid;grid-template-columns:190px 1fr;gap:16px;padding:22px;min-height:210px}.truck img{width:190px;height:140px;object-fit:contain;align-self:center}.truck h3{font-size:30px;margin:0 0 8px}.tag{display:inline-block;border-radius:999px;padding:6px 12px;font-weight:900;font-size:13px}.tag.ruta{background:#d7f8e4;color:#147a45;border:1px solid #90ddb2}.tag.sin{background:#ffdede;color:#a41919;border:1px solid #ff9a9a}.tag.mant{background:#fff0c2;color:#8a6100;border:1px solid #f3ca52}.truck p{margin:5px 0;color:#465872;font-weight:700}.truck .actions{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}.small{padding:8px 12px;font-size:13px}.box{padding:22px;margin-top:28px}.hidden{display:none!important}.add-title{display:flex;align-items:center;gap:14px}.add-title img{width:74px;height:auto;object-fit:contain}.maintenance-note{font-size:13px;color:var(--muted);font-weight:800;margin-top:6px}.form-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}input,select,textarea{width:100%;padding:13px 14px;border-radius:12px;border:1px solid var(--line);background:#fff;color:var(--ink);font-weight:800;font-size:15px}textarea{min-height:90px}.full{grid-column:1/-1}.hint{color:var(--muted);font-weight:800}.alert{background:#ffe4e4;color:#9a1111;border:1px solid #ffa1a1;padding:14px;border-radius:14px;margin:14px 0;font-weight:900}.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.56);z-index:20;align-items:center;justify-content:center;padding:20px}.modal:target{display:flex}.modal-card{background:#f8fafc;width:min(1250px,96vw);max-height:90vh;overflow:auto}.modal-head{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding:18px 26px}.modal-body{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:24px}.close{font-size:26px;text-decoration:none;color:var(--ink);font-weight:950}.history{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}.history-row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line);font-weight:800;color:#394960}@media(max-width:1200px){.grid,.cards{grid-template-columns:repeat(2,1fr)}.form-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:760px){.wrap{padding:16px}.grid,.cards,.form-grid,.modal-body{grid-template-columns:1fr}.truck{grid-template-columns:1fr}.hero{margin-top:40px}.hello{display:none}}
+</style></head><body><div class="wrap">
+<nav class="nav"><img class="logo" src="assets/img/icon-San-Miguel.png" alt="San Miguel"><a href="#">Cortes</a><a href="#">Administracion</a><a class="active" href="camionetas.php">Consultas</a><a href="#">Rutas</a><div class="hello">Buenos días ☀️ | Control de Unidades</div></nav>
+<section class="hero"><h1>Control de Unidades</h1><div class="date">Fecha Actual<br><?=h(strftime('%A, %e de %B de %Y'))?></div></section>
+<?php foreach($errors as $e): ?><div class="alert"><?=h($e)?></div><?php endforeach; ?>
+<section class="grid"><div class="stat"><h3>Resumen de Unidades</h3><div class="stat-row"><div class="pillbox"><span>Total</span><?=h($stats['total'])?></div><div class="pillbox"><span>Activas</span><?=h($stats['activas'])?></div><div class="pillbox"><span>Mantenimiento</span><?=h($stats['mantenimiento'])?></div><div class="pillbox"><span>Sin uso</span><?=h($stats['inactivas'])?></div></div></div><div class="stat"><h3>Km por camioneta</h3><div class="chart"><?php foreach(array_slice($trucks,0,4) as $t): ?><div title="<?=h($t['eco'])?>" class="bar" style="height:<?=max(14,min(90,($t['kilometraje_actual']/180000)*90))?>px"></div><?php endforeach; ?></div></div><div class="stat"><h3>Gasolina registrada</h3><div class="chart"><?php foreach(array_slice($trucks,0,5) as $t): ?><div title="<?=h($t['eco'])?>" class="bar o" style="height:<?=max(10,(int)$t['tanque_gasolina'])?>px"></div><?php endforeach; ?></div></div><div class="stat"><h3>Próximos mantenimientos</h3><?php foreach(array_slice($trucks,0,3) as $t): ?><div class="history-row"><span><?=h($t['eco'])?><br><small>Cada <?=h(number_format(mantenimiento_intervalo_km($t['modelo'])))?> km</small></span><strong><?=h(number_format(proximo_mantenimiento_km($t)))?> km</strong></div><?php endforeach; ?></div></section>
+
+<div class="section-head"><h2>Camionetas Activas</h2><button class="btn" type="button" onclick="const f=document.getElementById('addForm'); f.classList.toggle('hidden'); if(!f.classList.contains('hidden')) f.scrollIntoView({behavior:'smooth',block:'start'});">+ Agregar camioneta</button></div>
+<div class="cards"><?php foreach($active as $t): truck_card($t); endforeach; if(!$active) echo '<p class="hint">Todavía no hay camionetas activas.</p>'; ?></div>
+<div class="section-head"><h2>Camionetas Inactivas</h2></div>
+<div class="cards"><?php foreach($inactive as $t): truck_card($t); endforeach; if(!$inactive) echo '<p class="hint">Todavía no hay camionetas inactivas.</p>'; ?></div>
+
+<section class="box hidden" id="addForm"><div class="add-title"><img src="img/NP-300.png" alt="Camioneta"><h2>Nueva camioneta</h2></div><p class="hint">Eco, matrícula y número de serie no se pueden repetir. Si la actividad es “en ruta”, el conductor es obligatorio. Mantenimiento: modelos 2014 y 2015 cada 10,000 km; modelos nuevos cada 5,000 km.</p><form method="post" class="form-grid"><input type="hidden" name="action" value="add_truck"><input name="eco" placeholder="Número de eco *" required><input name="modelo" placeholder="Modelo de camioneta *" required><input name="no_serie" placeholder="No. de serie *" required><input name="matricula" placeholder="Matrícula / placas *" required><input name="fecha_ultimo_mantenimiento" type="date" title="Fecha último mantenimiento"><input name="kilometraje_actual" type="number" min="0" placeholder="Kilometraje registrado"><input name="tanque_gasolina" type="number" min="0" max="100" placeholder="% tanque gasolina"><select name="actividad" required><option value="sin uso">Sin uso</option><option value="en ruta">En ruta</option><option value="mantenimiento">Mantenimiento</option></select><input list="vendedores" name="nombre_conductor" placeholder="Nombre del vendedor"><input name="telefono_conductor" placeholder="Teléfono vendedor"><input name="correo_conductor" type="email" placeholder="Correo vendedor"><input name="fecha_uso" type="date" title="Fecha de uso"><button class="btn blue full">Guardar camioneta</button></form></section>
+<datalist id="vendedores"><?php foreach($vendors as $v): ?><option value="<?=h($v)?>"><?php endforeach; ?></datalist>
+</div>
+<?php
+function truck_card(array $t): void { $tag = $t['actividad']==='en ruta'?'ruta':($t['actividad']==='mantenimiento'?'mant':'sin'); ?>
+<div class="truck"><img src="img/NP-300.png" onerror="this.src='img/truck.png'" alt="camioneta"><div><div style="display:flex;justify-content:space-between;gap:8px"><h3><?=h($t['eco'])?></h3><span class="tag <?=$tag?>"><?=h(ucfirst($t['actividad']))?></span></div><p><strong><?=h(number_format((float)$t['kilometraje_actual']))?> km</strong> · Gasolina <?=h($t['tanque_gasolina'])?>%</p><p><?=h($t['conductor'] ?: 'Sin asignar')?></p><p>Placas: <?=h($t['matricula'])?></p><p>Último Mant: <?=h($t['fecha_ultimo_mantenimiento'] ?: '—')?></p><p>Próx Mant: <?=h(number_format(proximo_mantenimiento_km($t)))?> km</p><p class="maintenance-note">Intervalo: <?=h(number_format(mantenimiento_intervalo_km($t['modelo'])))?> km</p><div class="actions"><a class="btn light small" href="#detalle<?=h($t['id'])?>">Ver más</a></div></div></div>
+<div class="modal" id="detalle<?=h($t['id'])?>"><div class="modal-card"><div class="modal-head"><h2>Detalles de la Unidad: <?=h($t['eco'])?></h2><a class="close" href="#">×</a></div><div class="modal-body"><section class="box"><h3>Datos de camioneta</h3><p><b>Modelo:</b> <?=h($t['modelo'])?></p><p><b>No. de serie:</b> <?=h($t['no_serie'])?></p><p><b>Matrícula:</b> <?=h($t['matricula'])?></p><p><b>Kilometraje:</b> <?=h(number_format((float)$t['kilometraje_actual']))?> km</p><p><b>Tanque:</b> <?=h($t['tanque_gasolina'])?>%</p><p><b>Intervalo mantenimiento:</b> <?=h(number_format(mantenimiento_intervalo_km($t['modelo'])))?> km</p><p><b>Próximo mantenimiento:</b> <?=h(number_format(proximo_mantenimiento_km($t)))?> km</p><form method="post" class="form-grid"><input type="hidden" name="action" value="update_plates"><input type="hidden" name="id" value="<?=h($t['id'])?>"><input name="matricula" value="<?=h($t['matricula'])?>"><button class="btn blue">Actualizar placas</button></form><hr><form method="post" class="form-grid"><input type="hidden" name="action" value="update_indicators"><input type="hidden" name="id" value="<?=h($t['id'])?>"><input name="kilometraje_actual" type="number" min="0" value="<?=h($t['kilometraje_actual'])?>"><input name="tanque_gasolina" type="number" min="0" max="100" value="<?=h($t['tanque_gasolina'])?>"><button class="btn blue full">Actualizar km y gasolina de hoy</button></form></section><section class="box"><h3>Datos de conductor</h3><p><b>Nombre:</b> <?=h($t['conductor'] ?: 'Sin asignar')?></p><p><b>Teléfono:</b> <?=h($t['telefono'] ?: '—')?></p><p><b>Correo:</b> <?=h($t['correo'] ?: '—')?></p><p><b>Desde:</b> <?=h($t['fecha_inicio'] ?: '—')?></p><form method="post" class="form-grid"><input type="hidden" name="action" value="update_driver"><input type="hidden" name="id" value="<?=h($t['id'])?>"><select name="actividad"><option value="en ruta">En ruta</option><option value="sin uso">Sin uso</option><option value="mantenimiento">Mantenimiento</option></select><input list="vendedores" name="nombre_conductor" placeholder="Nuevo conductor"><input name="telefono_conductor" placeholder="Teléfono"><input name="correo_conductor" type="email" placeholder="Correo"><input name="fecha_uso" type="date" value="<?=h(date('Y-m-d'))?>"><button class="btn blue full">Actualizar conductor / actividad</button></form></section><section class="box"><h3>Actualizar mantenimiento</h3><form method="post" class="form-grid"><input type="hidden" name="action" value="update_maintenance"><input type="hidden" name="id" value="<?=h($t['id'])?>"><input name="fecha_mantenimiento" type="date" value="<?=h(date('Y-m-d'))?>"><input name="kilometraje" type="number" placeholder="Kilometraje"><textarea name="notas" class="full" placeholder="Notas de mantenimiento"></textarea><button class="btn full">Guardar mantenimiento</button></form></section><section class="box"><h3>Historial de conductores</h3><?php global $pdo; $hist=$pdo->prepare('SELECT * FROM camioneta_conductores WHERE camioneta_id=? ORDER BY fecha_inicio DESC'); $hist->execute([$t['id']]); foreach($hist as $r): ?><div class="history-row"><span><?=h($r['nombre'])?><br><small><?=h($r['telefono'])?> · <?=h($r['correo'])?></small></span><strong><?=h($r['fecha_inicio'])?> a <?=h($r['fecha_fin'] ?: 'Actual')?></strong></div><?php endforeach; ?><h3>Historial diario</h3><?php $ind=$pdo->prepare('SELECT * FROM camioneta_indicadores_diarios WHERE camioneta_id=? ORDER BY fecha DESC LIMIT 15'); $ind->execute([$t['id']]); foreach($ind as $r): ?><div class="history-row"><span><?=h($r['fecha'])?></span><strong><?=h(number_format((float)$r['kilometraje']))?> km · <?=h($r['tanque_gasolina'])?>%</strong></div><?php endforeach; ?></section></div></div></div>
+<?php } ?>
+</body></html>
